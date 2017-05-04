@@ -1,0 +1,239 @@
+---
+title: "water project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(caret)
+library(dplyr)
+library(purrr)
+setwd("C:/Users/jaycb/Desktop/Water Project")
+train_ind=read.csv("train_ind.csv")
+test_ind=read.csv("test_ind.csv")
+names(train_ind)
+str(train_ind)
+train_lab=read.csv("train_lab.csv")
+train_ind$istr="Yes"
+test_ind$istr="No"
+train_ind=rbind(train_ind,test_ind)
+train_ind$date_recorded=as.character(train_ind$date_recorded)
+train_ind$year=as.factor(unlist(map(train_ind$date_recorded, function(x) unlist(strsplit(x,"-"))[1])))
+train_ind$month=as.factor(unlist(map(train_ind$date_recorded, function(x) unlist(strsplit(x,"-"))[2])))
+train_ind$day=as.factor(unlist(map(train_ind$date_recorded, function(x) unlist(strsplit(x,"-"))[3])))
+train_ind$date_recorded=NULL
+train_ind$ward=NULL
+train_ind$funder=NULL
+train_ind$scheme_name=NULL
+train_ind$subvillage=NULL
+train_ind$installer=NULL
+train_ind$recorded_by=NULL
+train_ind$region_code=as.factor(as.character(train_ind$region_code))
+train_ind$district_code=as.factor(as.character(train_ind$district_code))
+train_ind$construction_year=as.factor(as.character(train_ind$construction_year))
+cnames=names(train_ind)
+
+
+### XGBoost
+library(xgboost)
+library(caret)
+
+train<-train_ind[train_ind$istr=="Yes",]
+train$target<-map_chr(train_lab$status_group,function(x) c("F","FNR","NF")[x])
+train$istr=NULL
+test<- train_ind[train_ind$istr=="No",]
+test$istr=NULL
+
+data_test.noID<-subset(test, select = -id)
+
+#Remove the id and status group columns from the train dataset. I don't want these columns
+#to affect the the model
+data_train<-subset(train, select = c(-id,-target))
+data_test<-test
+
+#Convert data frames to numeric matrices. Xgboost requires user to enter data as a numeric matrix
+data_test.noID <- as.matrix(as.data.frame(lapply(data_test.noID, as.numeric)))
+data_train <- as.matrix(as.data.frame(lapply(data_train, as.numeric)))
+data_test<-as.matrix(as.data.frame(lapply(data_test, as.numeric)))
+label<-unlist(map(train_lab$status_group,as.numeric))
+
+#Create a xgb.DMatrix which is the best format to use to create an xgboost model
+train.DMatrix <- xgb.DMatrix(data = data_train,label = label, missing = NA)
+#Set i=2 because the first column is for the id variable
+i=2
+
+#Create data frame to hold the 11 solutions developed by the model
+solution.table<-data.frame(id=data_test[,"id"])
+for (i in 2:20){
+  #Set seed so that the results are reproducible
+  set.seed(245*i)
+  cat("Running model",i)
+
+#Create model using the same parameters used in xgb.cv
+model <- xgboost(data = train.DMatrix, objective = "multi:softmax", booster = "gbtree",
+                 eval_metric = "merror", nrounds = 50*i, 
+                 num_class = 4,eta = 0.3/i, max_depth = i, colsample_bytree = 0.6)
+
+#Predict. Used the data_test.noID because it contained the same number of columns as the train.DMatrix
+#used to build the model.
+predict <- predict(model,data_test.noID)
+
+#Modify prediction labels to match submission format
+predict[predict==1]<-"functional"
+predict[predict==2]<-"functional needs repair"
+predict[predict==3]<-"non functional"
+
+#View prediction
+table(predict)
+
+#Add the solution to column i of the solutions data frame. This creates a data frame with a column for
+#each prediction set. Each prediction is a vote for that prediction. Next I will count the number of votes
+#for each prediction as use the element with the most votes as my final solution.
+solution.table[,i]<-predict
+}
+
+#Count the number of votes for each solution for each row
+solution.table.count<-apply(solution.table,MARGIN=1,table)
+
+#Create a vector to hold the final solution
+predict.combined<-vector()
+
+x=1
+#Finds the element that has the most votes for each prediction row
+for (x in 1:nrow(data_test)){
+  predict.combined[x]<-names(which.max(solution.table.count[[x]]))}
+
+#View the number of predictions for each classification
+table(predict.combined)
+
+#Create solution data frame
+solution<- data.frame(id=data_test[,"id"], status_group=predict.combined)
+
+#View the first five rows of the solution to ensure that it follows submission format rules
+head(solution)
+
+#Create csv submission file
+write.csv(solution, file = "Water_xgb_29.csv", row.names = FALSE) 
+
+
+
+
+## SPARK Models
+### GBM
+  nfolds <- 5  
+ library(h2o)
+ h2o.init(max_mem_size = "7g")
+ library(sparklyr)
+ library(rsparkling)
+ sc <- spark_connect(master = "local")
+ train_tbl<-copy_to(sc,train)
+ test_tbl<-copy_to(sc,test)
+ training <- as_h2o_frame(sc, train_tbl, strict_version_check = FALSE)
+ testing <- as_h2o_frame(sc, test_tbl, strict_version_check = FALSE)
+  y <- "target"
+  x <- setdiff(names(training), y)
+  training[,y] <- as.factor(training[,y])
+  c_names<-names(training)
+  for (c in 1:length(c_names)){
+    m=c_names[c]
+    if (is.character(training[,m])){
+     training[,m] <- as.factor(training[,m])
+    }
+  }
+#test <- as_h2o_frame(sc, partitions$test, strict_version_check = FALSE)
+  #splits <- h2o.splitFrame(training,ratios = 0.90, seed = 1)
+  gbm_model <- h2o.gbm(x = x, 
+                     y = y,
+                     training_frame = splits[[1]],
+                     validation_frame = splits[[2]],                     
+                     ntrees = 10,
+                     max_depth = 3,
+                     learn_rate = 0.4,
+                     col_sample_rate = 0.7,
+                     nfolds = nfolds,
+                     #fold_assingment == "Modulo",
+                     seed = 1,
+                     keep_cross_validation_predictions = TRUE)
+  h2o.confusionMatrix(gbm_model, valid = TRUE)
+  pred = h2o.predict(object = gbm_model, newdata = testing)
+  predicted<- as.data.frame(pred$predict)
+  
+  sub=read.csv("SubmissionFormat.csv")
+  sub$status_group=map(predicted['predict'],function(x) c("functional","functional needs repair","non functional")[x])$predict
+  
+  write.csv(sub, file = "water_gbm.csv", row.names = F)
+
+  
+  ### deep learning model
+  
+  dl_fit <- h2o.deeplearning(x = x, y = y,
+                           training_frame = splits[[1]],
+                           epochs = 1,
+                           activation = "Rectifier",
+                           hidden = c(4, 2,4),
+                           input_dropout_ratio = 0.7,
+                           keep_cross_validation_predictions = TRUE,
+                           nfolds = nfolds,
+                           fold_assingment == Modulo)
+  h2o.performance(dl_fit, newdata = splits[[2]])
+  pred = h2o.predict(object = dl_fit, newdata = testing)
+  predicted<- as.data.frame(pred$predict)
+  
+  sub=read.csv("SubmissionFormat.csv")
+  sub$status_group=map(predicted['predict'],function(x) c("functional","functional needs repair","non functional")[x])$predict
+  
+  write.csv(sub, file = "water_dl.csv", row.names = F)
+
+
+  ###### Random forest
+rf1 <- h2o.randomForest(x = x, y = y, #distribution = "bernoulli",
+                        training_frame = training,
+                        #validation_frame = splits[[2]],
+                        seed = 1,
+                        ntrees = 2000,
+                        max_depth = 15,
+                        nfolds = nfolds,
+                        #fold_assignment = "Modulo",
+                        keep_cross_validation_predictions = TRUE)
+h2o.confusionMatrix(rf1, valid = TRUE)
+pred = h2o.predict(object = rf1, newdata = testing)
+  predicted<- as.data.frame(pred$predict)
+  
+  sub=read.csv("SubmissionFormat.csv")
+  sub$status_group=map(predicted['predict'],function(x) c("functional","functional needs repair","non functional")[x])$predict
+  
+  write.csv(sub, file = "water_rf_tune.csv", row.names = F)
+  
+  
+    ### stacking model
+
+  library(h2oEnsemble)
+  
+my_gbm <- h2o.gbm(x = x,
+                  y = y,
+                  training_frame = training,
+                  #distribution = "bernoulli",
+                  ntrees = 10,
+                  max_depth = 3,
+                  min_rows = 2,
+                  learn_rate = 0.2,
+                  nfolds = nfolds,
+                  fold_assignment = "Modulo",
+                  keep_cross_validation_predictions = TRUE,
+                  seed = 1)
+
+# Train & Cross-validate a RF
+my_rf <- h2o.randomForest(x = x,
+                          y = y,
+                          training_frame = training,
+                          ntrees = 1000,
+                          max_depth = 30,
+                          nfolds = nfolds,
+                          fold_assignment = "Modulo",
+                          keep_cross_validation_predictions = TRUE,
+                          seed = 1)
+
+
+
+s
+```
